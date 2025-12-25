@@ -1,0 +1,59 @@
+# =========================
+# Python cache / artifacts
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual environments
+# (optional, but common)
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Packaging / build output
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# Test / coverage artifacts
+# =========================
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.pytest_cache/
+
+# =========================
+# Logs & runtime artifacts
+# =========================
+*.log
+
+# =========================
+# Editor / OS cruft
+# =========================
+# VS Code
+.vscode/
+# JetBrains
+.idea/
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+desktop.ini
+
+# =========================
+# Config files with secrets
+# =========================
+# DO NOT commit Canvas API keys
+config.ini
+
+# Optional: allow committing an example config
+!config.example.ini
