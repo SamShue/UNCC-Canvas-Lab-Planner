@@ -35,7 +35,7 @@ Configuration
 - Copy and edit `config.ini` (example below).
 - Required sections/keys:
   - `[canvas]`
-    - `base_url` — your Canvas URL (e.g. `https://canvas.uncc.edu`)
+    - `base_url` — your Canvas URL (e.g. `https://uncc.instructure.com/`)
     - `api_key` — Canvas API token with permissions to edit assignment overrides
     - `course_id` — Canvas course ID to operate on
   - `[semester]`
@@ -52,14 +52,13 @@ Example `config.ini`:
 
 ```ini
 [canvas]
-base_url = https://canvas.uncc.edu
+base_url = https://uncc.instructure.com/
 api_key = <YOUR_TOKEN>
 course_id = 12345
 
 [semester]
-calendar_url = https://registrar.charlotte.edu/academic-calendar
-anchor = Academic Calendar
-# lab_base = 1    ; optional — edit manually to force base 0 or 1
+calendar_url = https://registrar.charlotte.edu/calendars-schedules/academic-year-fall-2025-spring-2026/#spring-full-term
+anchor = spring-full-term
 
 [time]
 timezone = America/New_York

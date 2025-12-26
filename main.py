@@ -1156,7 +1156,7 @@ class App(tk.Tk):
             if not read_files:
                 # Create a default/dummy config file so users have a starting point.
                 cfg['canvas'] = {
-                    'base_url': 'https://canvas.example.edu',
+                    'base_url': 'https://uncc.instructure.com/',
                     'api_key': '<YOUR_TOKEN_HERE>',
                     'course_id': '12345',
                 }
