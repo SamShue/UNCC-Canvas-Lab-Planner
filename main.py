@@ -700,7 +700,7 @@ def build_due_suggestions(
     due_time: dt.time,
     delay_weeks: int,
     lab_base: int = 1,
-) -> List[DueSuggestion]:
+) -> Tuple[List[DueSuggestion], List[int]]:
     """
     Maps lab numbers to instructional weeks:
       lab1_week_index = 1 + delay_weeks   (week after first week) + delay
@@ -722,17 +722,7 @@ def build_due_suggestions(
     max_n = max(num for _, _, num in classified)
 
     weeks = calendar.instructional_weeks()
-    # Need enough weeks to place labs
     base_index = 1 + max(0, delay_weeks)  # "week after first week" + delay
-
-    # Compute how far into `weeks` our highest-numbered lab will land,
-    # taking into account whether numbering starts at 0 or 1.
-    needed_last_index = base_index + (max_n - lab_base)
-    if needed_last_index >= len(weeks) or (base_index < 0):
-        raise ValueError(
-            f"Not enough instructional weeks to schedule up to Lab {max_n} (lab base={lab_base}). "
-            f"Have {len(weeks)} instructional weeks, need at least {needed_last_index + 1}."
-        )
 
     # lab_num -> week_monday (compute per actual lab number present)
     lab_week: Dict[int, dt.date] = {}
@@ -743,10 +733,12 @@ def build_due_suggestions(
         lab_week[n] = weeks[idx]
 
     suggestions: List[DueSuggestion] = []
+    unschedulable_assignment_ids: List[int] = []
 
     for a, kind, num in classified:
         wk = lab_week.get(num)
         if not wk:
+            unschedulable_assignment_ids.append(a.id)
             continue
 
         per_section: Dict[int, dt.datetime] = {}
@@ -777,7 +769,7 @@ def build_due_suggestions(
 
     # Sort by assignment name for stable display
     suggestions.sort(key=lambda x: x.assignment_name.lower())
-    return suggestions
+    return suggestions, unschedulable_assignment_ids
 
 
 # -----------------------------
@@ -1070,6 +1062,7 @@ class App(tk.Tk):
         self.section_meetings: Dict[int, SectionMeeting] = {}
         self.assignments: List[Assignment] = []
         self.suggestions: List[DueSuggestion] = []
+        self.unschedulable_assignment_ids: set[int] = set()
 
         self._build_ui()
         self._load_config_and_init()
@@ -1132,6 +1125,7 @@ class App(tk.Tk):
         self.tree.heading("preview", text="Auto Due Preview (per section)")
         self.tree.column("assignment", width=420, anchor="w")
         self.tree.column("preview", width=640, anchor="w")
+        self.tree.tag_configure("unschedulable", background="#fff3cd")
         self.tree.pack(fill="both", expand=True, padx=5, pady=5)
 
         # Help footer
@@ -1389,9 +1383,17 @@ class App(tk.Tk):
                 delay_weeks=delay,
                 lab_base=(int(self.lab_base) if getattr(self, "lab_base", None) is not None else 1),
             )
-            self.suggestions = suggestions
+            self.suggestions, unschedulable_ids = suggestions
+            self.unschedulable_assignment_ids = set(unschedulable_ids)
             self.after(0, self._refresh_tree_with_suggestions)
-            self.after(0, lambda: self._set_status(f"Computed due dates for {len(suggestions)} assignments."))
+
+            def set_compute_status():
+                msg = f"Computed due dates for {len(self.suggestions)} assignments."
+                if self.unschedulable_assignment_ids:
+                    msg += f" Skipped {len(self.unschedulable_assignment_ids)} assignment(s) that exceed available instructional weeks."
+                self._set_status(msg)
+
+            self.after(0, set_compute_status)
         except Exception as e:
             self.after(0, lambda e=e: messagebox.showerror("Compute error", str(e)))
             self.after(0, lambda: self._set_status("Compute failed."))
@@ -1400,14 +1402,29 @@ class App(tk.Tk):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
 
-        # Pretty preview per section
-        for sug in self.suggestions:
-            parts = []
-            for sid, due_dt in sorted(sug.due_by_section.items(), key=lambda x: self.section_meetings.get(x[0], SectionMeeting(x[0], str(x[0]), [], dt.time())).section_name.lower()):
-                sname = self.section_meetings[sid].section_name if sid in self.section_meetings else str(sid)
-                parts.append(f"{sname}: {due_dt.strftime('%Y-%m-%d %H:%M %Z')}")
-            preview = " | ".join(parts)
-            self.tree.insert("", "end", values=(sug.assignment_name, preview))
+        suggestions_by_id = {s.assignment_id: s for s in self.suggestions}
+        eligible = [a for a in self.assignments if classify_assignment(a.name)]
+        eligible.sort(key=lambda x: x.name.lower())
+
+        for a in eligible:
+            sug = suggestions_by_id.get(a.id)
+            if sug is not None:
+                parts = []
+                for sid, due_dt in sorted(
+                    sug.due_by_section.items(),
+                    key=lambda x: self.section_meetings.get(x[0], SectionMeeting(x[0], str(x[0]), [], dt.time())).section_name.lower()
+                ):
+                    sname = self.section_meetings[sid].section_name if sid in self.section_meetings else str(sid)
+                    parts.append(f"{sname}: {due_dt.strftime('%Y-%m-%d %H:%M %Z')}")
+                preview = " | ".join(parts)
+                self.tree.insert("", "end", values=(a.name, preview))
+            elif a.id in self.unschedulable_assignment_ids:
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(a.name, "(not scheduled: exceeds available instructional weeks)"),
+                    tags=("unschedulable",),
+                )
 
     def on_apply(self):
         if not self.client:
