@@ -19,16 +19,55 @@ per-section due dates (applied as Canvas assignment overrides).
 
 Prerequisites
 - Python 3.9+ (3.11 recommended).
-- Install Python packages from `requirements.txt`:
+- Install Python packages from `requirements.txt` (commands below).
 
-```powershell
-pip install -r requirements.txt
+Platform setup (Linux and Windows)
+
+Linux (bash)
+1. Create a virtual environment:
+
+```bash
+python3 -m venv .venv
 ```
 
-On Windows, `zoneinfo` may require the `tzdata` package:
+2. Activate it:
+
+```bash
+source .venv/bin/activate
+```
+
+3. Install dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Windows (PowerShell)
+1. Create a virtual environment:
 
 ```powershell
-pip install tzdata
+py -3 -m venv .venv
+```
+
+2. Activate it:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+3. Install dependencies:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Windows timezone note
+- On Windows, `zoneinfo` may require `tzdata`:
+
+```powershell
+python -m pip install tzdata
 ```
 
 Configuration
@@ -68,8 +107,20 @@ due_time_hhmm = 23:59
 Usage
 - Launch the GUI:
 
+Linux (bash):
+
+```bash
+python main.py
+# or
+python main.py path/to/config.ini
+```
+
+Windows (PowerShell):
+
 ```powershell
-python main.py         # or: python main.py path\to\config.ini
+python main.py
+# or
+python main.py path\to\config.ini
 ```
 
 Typical workflow:
@@ -91,6 +142,14 @@ Config editor and notes
 
 Debugging
 - Enable verbose debug prints for scraper and heuristics:
+
+Linux (bash):
+
+```bash
+CANVAS_LAB_PLANNER_DEBUG=1 python main.py
+```
+
+Windows (PowerShell):
 
 ```powershell
 $env:CANVAS_LAB_PLANNER_DEBUG = '1'; python main.py
