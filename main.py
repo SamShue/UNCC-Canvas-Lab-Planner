@@ -151,6 +151,87 @@ def normalize_banner_text(value: str) -> str:
     return re.sub(r"[^A-Z0-9]+", " ", value.upper()).strip()
 
 
+TERM_LIKE_SUBJECTS = {
+    "FALL",
+    "SPRING",
+    "SUMMER",
+    "WINTER",
+    "AUTUMN",
+    "TERM",
+    "SESSION",
+}
+
+YEAR_MIN = 1900
+YEAR_MAX = 2099
+
+BANNER_TERM_SUFFIX_BY_SEASON = {
+    "SPRING": "20",
+    "SUMMER": "50",
+    "FALL": "80",
+    "AUTUMN": "80",
+    "WINTER": "10",
+}
+
+
+def _looks_like_term_marker(subject: str, number: str) -> bool:
+    if subject in TERM_LIKE_SUBJECTS:
+        return True
+    if re.fullmatch(r"(19|20)\d{2}[A-Z]?", number):
+        return subject in TERM_LIKE_SUBJECTS or subject.endswith("TERM")
+    return False
+
+
+def _is_year_like_number(number: str) -> bool:
+    return bool(re.fullmatch(r"\d{4}", number)) and YEAR_MIN <= int(number) <= YEAR_MAX
+
+
+def _extract_banner_course_number(value: str) -> Optional[str]:
+    candidate = str(value or "").upper()
+    if not candidate:
+        return None
+
+    # Prefer standalone 4-digit(+optional letter) tokens like 2181L.
+    for token in re.findall(r"\b(\d{4}[A-Z]?)\b", candidate):
+        if _is_year_like_number(token):
+            continue
+        return token
+    return None
+
+
+def guess_banner_term_code(term_name: str) -> Optional[str]:
+    normalized = normalize_banner_text(term_name)
+
+    # Prefer a direct Banner-style 6-digit term code if present (e.g., 202680).
+    direct_code = re.search(r"\b(19\d{4}|20\d{4})\b", normalized)
+    if direct_code:
+        code = direct_code.group(1)
+        if code[-2:] in {"10", "20", "50", "80"}:
+            return code
+
+    season = ""
+    year = ""
+
+    # Common format: FALL 2026 (FULL TERM)
+    match = re.search(r"\b(SPRING|SUMMER|FALL|AUTUMN|WINTER)\s+(19\d{2}|20\d{2})\b", normalized)
+    if match:
+        season = match.group(1)
+        year = match.group(2)
+    else:
+        # Alternate format: 2026 FALL (FULL TERM)
+        match = re.search(r"\b(19\d{2}|20\d{2})\s+(SPRING|SUMMER|FALL|AUTUMN|WINTER)\b", normalized)
+        if match:
+            year = match.group(1)
+            season = match.group(2)
+
+    if not season or not year:
+        return None
+
+    suffix = BANNER_TERM_SUFFIX_BY_SEASON.get(season)
+    if not suffix:
+        return None
+    return f"{year}{suffix}"
+
+
 def parse_banner_course_code(course: CourseOption) -> Optional[Tuple[str, str]]:
     return parse_banner_course_query(course.course_code) or parse_banner_course_query(course.name)
 
@@ -159,12 +240,25 @@ def parse_banner_course_query(value: str) -> Optional[Tuple[str, str]]:
     candidate = str(value or "").strip().upper()
     if not candidate:
         return None
-    match = re.search(r"\b([A-Z]{2,10})\s*[- ]?\s*([0-9]{3,4}[A-Z]?)\b", candidate)
-    if match:
-        return match.group(1), match.group(2)
-    match = re.search(r"\b([A-Z]{2,10})\s+([0-9]{3,4}[A-Z]?)\b", candidate)
-    if match:
-        return match.group(1), match.group(2)
+
+    # If we can find a plain course number, use that first; subject is optional.
+    number_only = _extract_banner_course_number(candidate)
+    if number_only:
+        subject_match = re.search(rf"\b([A-Z]{{2,10}})\s*[- ]\s*{re.escape(number_only)}\b", candidate)
+        if subject_match and not _looks_like_term_marker(subject_match.group(1), number_only):
+            return subject_match.group(1), number_only
+        return "", number_only
+
+    matches = re.finditer(r"\b([A-Z]{2,10})\s*[- ]?\s*([0-9]{3,4}[A-Z]?)\b", candidate)
+    for match in matches:
+        subject = match.group(1)
+        number = match.group(2)
+        if _looks_like_term_marker(subject, number):
+            continue
+        if _is_year_like_number(number):
+            continue
+        return subject, number
+
     return None
 
 
@@ -811,13 +905,24 @@ class BannerClient:
             return self._term_cache
 
         self._warm_up()
-        data = self._json_candidates([
-            self._url("/term/getTerms"),
-            self._url("/term/getTerms?mode=search"),
-        ], params=None)
+        data: object = []
+        last_error: Optional[Exception] = None
 
-        if not data:
-            data = self._json_candidates([self._url("/term/getTerms")], params={"mode": "search"})
+        # NOTE: term/getTerms consistently 404s on UNCC's Banner instance.
+        # classSearch/getTerms is the endpoint the real Self-Service UI uses.
+        for params in ({"searchTerm": "", "offset": 1, "max": 50}, {"mode": "search"}):
+            try:
+                data = self._json_candidates([self._url("/classSearch/getTerms")], params=params)
+                if data:
+                    break
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        if not data and last_error is not None:
+            # Do not raise here; resolve_term_code can still use deterministic fallback.
+            self._term_cache = []
+            return self._term_cache
 
         if isinstance(data, list):
             terms = data
@@ -849,7 +954,13 @@ class BannerClient:
         normalized_target = normalize_banner_text(term_name)
         exact_tokens = set(normalized_target.split())
 
-        for term in self._fetch_terms():
+        terms: List[dict] = []
+        try:
+            terms = self._fetch_terms()
+        except Exception:
+            terms = []
+
+        for term in terms:
             display = normalize_banner_text(self._term_display(term))
             code = str(term.get("code") or term.get("value") or term.get("term") or term.get("id") or "").strip()
             if not code:
@@ -860,17 +971,33 @@ class BannerClient:
             if exact_tokens and exact_tokens <= display_tokens:
                 return code
 
-        if self._term_cache:
-            for term in self._term_cache:
+        if terms:
+            for term in terms:
                 display = self._term_display(term)
                 if normalized_target and normalized_target in normalize_banner_text(display):
                     return str(term.get("code") or term.get("value") or term.get("term") or term.get("id") or "").strip() or None
 
+        # Fallback: if term text includes a season/year phrase, match Banner terms by those tokens.
+        season_year = re.search(r"\b(SPRING|SUMMER|FALL|WINTER)\s+(19\d{2}|20\d{2})\b", normalized_target)
+        if season_year and terms:
+            season = season_year.group(1)
+            year = season_year.group(2)
+            for term in terms:
+                display = normalize_banner_text(self._term_display(term))
+                code = str(term.get("code") or term.get("value") or term.get("term") or term.get("id") or "").strip()
+                if not code:
+                    continue
+                if season in display and year in display:
+                    return code
+
+        guessed = guess_banner_term_code(term_name)
+        if guessed:
+            return guessed
+
         return None
 
     def _search_payload(self, subject: str, course_number: str, term_code: str) -> List[Tuple[str, str]]:
-        return [
-            ("txt_subject", subject),
+        payload = [
             ("txt_courseNumber", course_number),
             ("txt_term", term_code),
             ("pageOffset", "0"),
@@ -880,9 +1007,26 @@ class BannerClient:
             ("sortOrder", "asc"),
             ("chk_openOnly", "false"),
         ]
+        if subject:
+            payload.insert(0, ("txt_subject", subject))
+        return payload
 
     def search_sections(self, subject: str, course_number: str, term_code: str) -> List[dict]:
         self._warm_up()
+
+        # Critical step: Banner's search results endpoint reads the active term from
+        # server-side session state, not just from the txt_term field. The real
+        # Self-Service UI POSTs to /term/search to establish that state before
+        # calling searchResults. Skipping this step causes searchResults to
+        # silently return zero rows (no error, just an empty data list).
+        select_resp = self.s.post(
+            self._url("/term/search"),
+            params={"mode": "search"},
+            data={"term": term_code},
+            timeout=30,
+        )
+        select_resp.raise_for_status()
+
         response = self.s.post(
             self._url("/searchResults/searchResults"),
             data=self._search_payload(subject, course_number, term_code),
@@ -949,11 +1093,40 @@ class BannerClient:
                 return value
         return ""
 
-    def _canvas_section_suffix(self, section_name: str) -> Optional[str]:
-        match = re.search(r"(?:-|\b)(\d{3,4}[A-Z]?)\b", section_name)
-        if match:
-            return match.group(1)
+    def _canvas_section_suffix(self, section_name: str, course_number: str = "") -> Optional[str]:
+        """
+        Extract the Banner-style section/sequence identifier (e.g. "L01", "001")
+        from a Canvas section name.
+
+        Canvas section names for combined/cross-listed sections often embed the
+        course number itself (e.g. "ECGR-2181L-L01"), so a naive regex can match
+        the course number instead of the actual section suffix. To avoid that,
+        the course number is stripped out first, then the last remaining
+        alphanumeric token containing a digit is used as the section suffix.
+        """
+        normalized = str(section_name or "").upper()
+        if course_number:
+            normalized = re.sub(re.escape(course_number.upper()), " ", normalized)
+
+        tokens = re.findall(r"[A-Z0-9]+", normalized)
+        for token in reversed(tokens):
+            if re.search(r"\d", token):
+                return token
         return None
+
+    def _subject_hints_from_sections(self, sections: List[Tuple[int, str]]) -> List[str]:
+        hints: List[str] = []
+        for _section_id, section_name in sections:
+            normalized = str(section_name or "").upper()
+            match = re.search(r"\b([A-Z]{2,10})[-_\s]*\d{4}[A-Z]?\b", normalized)
+            if not match:
+                continue
+            subject = match.group(1)
+            if subject in TERM_LIKE_SUBJECTS:
+                continue
+            if subject not in hints:
+                hints.append(subject)
+        return hints
 
     def autofill_section_meetings(self, course: CourseOption, sections: List[Tuple[int, str]]) -> Dict[int, SectionMeeting]:
         parsed = parse_banner_course_code(course)
@@ -972,28 +1145,75 @@ class BannerClient:
         if not term_code:
             return {}
 
-        rows = self.search_sections(subject, course_number, term_code)
+        subject_hints = self._subject_hints_from_sections(sections)
+        subject_candidates: List[str] = []
+        normalized_subject = subject.upper().strip()
+        if normalized_subject:
+            subject_candidates.append(normalized_subject)
+        else:
+            subject_candidates.extend(subject_hints)
+
+        rows: List[dict] = []
+        tried_subjects: set[str] = set()
+        if subject_candidates:
+            for subject_candidate in subject_candidates:
+                if subject_candidate in tried_subjects:
+                    continue
+                tried_subjects.add(subject_candidate)
+                rows.extend(self.search_sections(subject_candidate, course_number, term_code))
+        else:
+            rows.extend(self.search_sections("", course_number, term_code))
+
+        if not rows and subject_candidates:
+            rows.extend(self.search_sections("", course_number, term_code))
+        if not rows:
+            return {}
+
+        normalized_course_number = course_number.upper().strip()
+        inferred_subject = normalized_subject
+        if not inferred_subject and len(subject_hints) == 1:
+            inferred_subject = subject_hints[0]
+
+        filtered_rows: List[dict] = []
+        for row in rows:
+            row_course_number = str(row.get("courseNumber", "")).upper().strip()
+            if row_course_number != normalized_course_number:
+                continue
+            if inferred_subject:
+                row_subject = str(row.get("subject", "")).upper().strip()
+                if row_subject != inferred_subject:
+                    continue
+            filtered_rows.append(row)
+        rows = filtered_rows
         if not rows:
             return {}
 
         rows_by_section: Dict[str, dict] = {}
+        rows_by_digits: Dict[str, dict] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
             section_number = self._row_section_number(row)
             if section_number:
                 rows_by_section[section_number] = row
+                digits = re.sub(r"[^0-9]", "", section_number)
+                if digits:
+                    rows_by_digits.setdefault(digits, row)
 
         if not rows_by_section:
             return {}
 
         autofilled: Dict[int, SectionMeeting] = {}
         for section_id, section_name in sections:
-            section_suffix = self._canvas_section_suffix(section_name)
+            section_suffix = self._canvas_section_suffix(section_name, course_number)
             candidate_row: Optional[dict] = None
-            if section_suffix and section_suffix in rows_by_section:
-                candidate_row = rows_by_section[section_suffix]
-            elif len(rows_by_section) == 1:
+            if section_suffix:
+                candidate_row = rows_by_section.get(section_suffix)
+                if not candidate_row:
+                    digits = re.sub(r"[^0-9]", "", section_suffix)
+                    if digits:
+                        candidate_row = rows_by_digits.get(digits)
+            if not candidate_row and len(rows_by_section) == 1:
                 candidate_row = next(iter(rows_by_section.values()))
 
             if not candidate_row:
@@ -1414,7 +1634,6 @@ class App(tk.Tk):
     def __init__(self, config_path: str = "config.ini"):
         super().__init__()
         self.title("Canvas Lab Planner")
-        self.geometry("1100x650")
 
         self.config_path = config_path
         self.canvas_cfg: Optional[CanvasConfig] = None
@@ -1426,7 +1645,6 @@ class App(tk.Tk):
         self.calendar: Optional[SemesterCalendar] = None
         self.client: Optional[CanvasClient] = None
         self.banner_client: BannerClient = BannerClient()
-        self.banner_course_code_var = tk.StringVar(value="(not estimated)")
         self.banner_search_var = tk.StringVar(value="")
 
         self.course_options: List[CourseOption] = []
@@ -1440,6 +1658,20 @@ class App(tk.Tk):
         self.unschedulable_assignment_ids: set[int] = set()
 
         self._build_ui()
+
+        # Size the window to fit everything the UI needs (Controls panel, meeting
+        # list, treeview, footer) instead of a fixed guess that can clip content
+        # as more controls are added. Capped to the available screen size.
+        self.update_idletasks()
+        req_w = self.winfo_reqwidth()
+        req_h = self.winfo_reqheight()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = min(req_w, screen_w - 40)
+        win_h = min(req_h, screen_h - 80)
+        self.minsize(min(req_w, screen_w - 40), min(req_h, screen_h - 80))
+        self.geometry(f"{win_w}x{win_h}")
+
         self._load_config_and_init()
 
     def _build_ui(self):
@@ -1450,59 +1682,86 @@ class App(tk.Tk):
         ctrl = ttk.LabelFrame(top, text="Controls", padding=10)
         ctrl.pack(fill="x", padx=5, pady=5)
 
-        ttk.Label(ctrl, text="Config file:").grid(row=0, column=0, sticky="w")
-        self.cfg_label = ttk.Label(ctrl, text=self.config_path)
-        self.cfg_label.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        label_font = ("Segoe UI", 9, "bold")
+        row = 0
 
-        ttk.Label(ctrl, text="Delay weeks (Lab 1 starts week after first week + delay):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(ctrl, text="Config file:").grid(row=row, column=0, sticky="w")
+        self.cfg_label = ttk.Label(ctrl, text=self.config_path)
+        self.cfg_label.grid(row=row, column=1, sticky="w", padx=(8, 0))
+        row += 1
+
+        ttk.Label(ctrl, text="Delay weeks (Lab 1 starts week after first week + delay):").grid(row=row, column=0, sticky="w", pady=(6, 0))
         self.delay_var = tk.IntVar(value=0)
         self.delay_spin = ttk.Spinbox(ctrl, from_=0, to=20, textvariable=self.delay_var, width=5)
-        self.delay_spin.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.delay_spin.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        row += 1
 
-        # Term / calendar info (populated after scraping)
-        ttk.Label(ctrl, text="Term:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Separator(ctrl, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+        row += 1
+
+        # --- Semester info (populated after scraping) ---
+        ttk.Label(ctrl, text="Semester", font=label_font).grid(row=row, column=0, sticky="w")
+        row += 1
+
+        ttk.Label(ctrl, text="Term:").grid(row=row, column=0, sticky="w", pady=(4, 0))
         self.term_var = tk.StringVar(value="(not loaded)")
-        ttk.Label(ctrl, textvariable=self.term_var).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(ctrl, textvariable=self.term_var).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        row += 1
 
-        ttk.Label(ctrl, text="First day:").grid(row=3, column=0, sticky="w")
+        ttk.Label(ctrl, text="First day:").grid(row=row, column=0, sticky="w")
         self.begin_var = tk.StringVar(value="(not loaded)")
-        ttk.Label(ctrl, textvariable=self.begin_var).grid(row=3, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(ctrl, textvariable=self.begin_var).grid(row=row, column=1, sticky="w", padx=(8, 0))
+        row += 1
 
-        ttk.Label(ctrl, text="Last day:").grid(row=4, column=0, sticky="w")
+        ttk.Label(ctrl, text="Last day:").grid(row=row, column=0, sticky="w")
         self.end_var = tk.StringVar(value="(not loaded)")
-        ttk.Label(ctrl, textvariable=self.end_var).grid(row=4, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(ctrl, textvariable=self.end_var).grid(row=row, column=1, sticky="w", padx=(8, 0))
+        row += 1
 
-        # Canvas course title (populated after loading Canvas data)
-        ttk.Label(ctrl, text="Course:").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Separator(ctrl, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+        row += 1
+
+        # --- Course selection + Banner search ---
+        ttk.Label(ctrl, text="Course", font=label_font).grid(row=row, column=0, sticky="w")
+        row += 1
+
+        ttk.Label(ctrl, text="Canvas course:").grid(row=row, column=0, sticky="w", pady=(4, 0))
         self.course_var = tk.StringVar(value="(not loaded)")
-        ttk.Label(ctrl, textvariable=self.course_var).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-
-        ttk.Label(ctrl, text="Estimated Banner course:").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(ctrl, textvariable=self.banner_course_code_var).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-
-        ttk.Label(ctrl, text="Banner search term (editable):").grid(row=7, column=0, sticky="w", pady=(8, 0))
-        self.banner_search_entry = ttk.Entry(ctrl, width=30, textvariable=self.banner_search_var)
-        self.banner_search_entry.grid(row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(ctrl, textvariable=self.course_var).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        row += 1
 
         # Course selector dropdown with fuzzy filtering against the API-backed list.
-        ttk.Label(ctrl, text="Course search:").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        # Clicking into it auto-selects existing text so a new query can replace it immediately.
+        ttk.Label(ctrl, text="Course search (fuzzy):").grid(row=row, column=0, sticky="w", pady=(4, 0))
         self.course_selector = ttk.Combobox(ctrl, width=72, state="normal")
-        self.course_selector.grid(row=8, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.course_selector.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
         self.course_selector.bind("<KeyRelease>", self._on_course_query_changed)
         self.course_selector.bind("<<ComboboxSelected>>", self._on_course_selected)
+        self.course_selector.bind("<FocusIn>", self._on_course_selector_focus_in)
+        row += 1
 
-        # Lab numbering is auto-detected (Lab 0 if present); no manual radio control.
+        # Single editable field for the Banner course number, pre-filled with an
+        # estimate parsed from the selected Canvas course (no separate read-only display).
+        ttk.Label(ctrl, text="Banner course number:").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        self.banner_search_entry = ttk.Entry(ctrl, width=30, textvariable=self.banner_search_var)
+        self.banner_search_entry.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        row += 1
 
+        # Buttons, arranged in a single column to keep the panel visually simple.
         btnrow = ttk.Frame(ctrl)
-        btnrow.grid(row=0, column=2, rowspan=9, sticky="e", padx=(20, 0))
-        ttk.Button(btnrow, text="Reload semester", command=self.on_reload_semester).grid(row=0, column=0, padx=5)
-        ttk.Button(btnrow, text="Load Canvas data", command=self.on_load_canvas).grid(row=0, column=1, padx=5)
-        ttk.Button(btnrow, text="Search section times", command=self.on_search_section_times).grid(row=0, column=2, padx=5)
-        ttk.Button(btnrow, text="Set section meeting times", command=self.on_set_meetings).grid(row=1, column=0, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Auto-compute due dates", command=self.on_compute).grid(row=1, column=1, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Apply to Canvas", command=self.on_apply).grid(row=1, column=2, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Show skipped weeks", command=self.on_show_skipped_weeks).grid(row=2, column=0, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Edit config", command=self.on_edit_config).grid(row=2, column=1, padx=5, pady=(8, 0))
+        btnrow.grid(row=0, column=2, rowspan=row, sticky="ne", padx=(24, 0))
+        button_specs = [
+            ("Reload semester", self.on_reload_semester),
+            ("Load Canvas data", self.on_load_canvas),
+            ("Search section times", self.on_search_section_times),
+            ("Set section meeting times", self.on_set_meetings),
+            ("Auto-compute due dates", self.on_compute),
+            ("Apply to Canvas", self.on_apply),
+            ("Show skipped weeks", self.on_show_skipped_weeks),
+            ("Edit config", self.on_edit_config),
+        ]
+        for btn_row, (text, command) in enumerate(button_specs):
+            ttk.Button(btnrow, text=text, command=command).grid(row=btn_row, column=0, padx=5, pady=2, sticky="ew")
 
         # Status
         self.status_var = tk.StringVar(value="Ready.")
@@ -1550,10 +1809,7 @@ class App(tk.Tk):
         if not parsed:
             return "(could not estimate)"
         subject, course_number = parsed
-        return f"{subject} {course_number}"
-
-    def _update_banner_course_display(self, course: Optional[CourseOption]) -> None:
-        self.banner_course_code_var.set(self._estimated_banner_course_text(course))
+        return f"{subject} {course_number}".strip()
 
     def _update_banner_search_term(self, course: Optional[CourseOption]) -> None:
         if not course:
@@ -1562,6 +1818,17 @@ class App(tk.Tk):
         estimated = self._estimated_banner_course_text(course)
         if estimated not in {"(not estimated)", "(could not estimate)"}:
             self.banner_search_var.set(estimated)
+
+    def _on_course_selector_focus_in(self, event=None):
+        """
+        Auto-select the existing text when the fuzzy course search box gains focus,
+        so typing a new query immediately replaces it. The selection is applied via
+        after_idle because the widget's own click handling would otherwise reset it.
+        """
+        def select_all():
+            self.course_selector.selection_range(0, "end")
+            self.course_selector.icursor("end")
+        self.after_idle(select_all)
 
     def _normalize_course_query(self, text: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
@@ -1671,7 +1938,6 @@ class App(tk.Tk):
             if self.client:
                 self.client.set_course_id(None)
             self.course_var.set("(not selected)")
-            self._update_banner_course_display(None)
             self._update_banner_search_term(None)
             self.course_selector.set("")
             self.section_meetings.clear()
@@ -1691,7 +1957,6 @@ class App(tk.Tk):
 
         self.course_var.set(display)
         self.course_selector.set(display)
-        self._update_banner_course_display(course_option)
         self._update_banner_search_term(course_option)
         self._load_section_meetings()
 
@@ -1756,20 +2021,17 @@ class App(tk.Tk):
             if current_course:
                 self.course_selector.set(current_course.label())
                 self.course_var.set(current_course.label())
-                self._update_banner_course_display(current_course)
                 self._update_banner_search_term(current_course)
                 self._load_section_meetings()
             else:
                 self.course_selector.set("")
                 self.course_var.set("(selected course not found)")
-                self._update_banner_course_display(None)
                 self._update_banner_search_term(None)
         elif len(courses) == 1:
             self._set_active_course(str(courses[0].id))
         else:
             self.course_selector.set("")
             self.course_var.set("(not selected)")
-            self._update_banner_course_display(None)
             self._update_banner_search_term(None)
 
         self._set_status(f"Loaded {len(courses)} Canvas courses. Type to search, then pick a course.")
@@ -1881,11 +2143,9 @@ class App(tk.Tk):
 
             if self.canvas_cfg.course_id:
                 self.course_var.set(f"Course ID {self.canvas_cfg.course_id}")
-                self._update_banner_course_display(None)
                 self._update_banner_search_term(None)
             else:
                 self.course_var.set("(not selected)")
-                self._update_banner_course_display(None)
                 self._update_banner_search_term(None)
 
             # Lab numbering base (optional in config under [semester] -> lab_base)
@@ -2085,22 +2345,31 @@ class App(tk.Tk):
         if not self.sections:
             messagebox.showerror("No sections loaded", "Load Canvas data first, then search for section times.")
             return
+        if not self.calendar:
+            messagebox.showerror("No semester loaded", "Click 'Reload semester' first so Banner term selection is implicit from the selected semester.")
+            return
 
         query_text = self.banner_search_var.get().strip()
         parsed_query = parse_banner_course_query(query_text)
         if not parsed_query:
-            messagebox.showerror("Invalid Banner search term", "Enter a subject and course number, for example MATH 1101.")
+            messagebox.showerror("Invalid Banner search term", "Enter a course number like 2181L, or subject + number like ECGR 2181L.")
             return
 
         self._set_status("Searching Banner for section times...")
-        self._run_threaded(lambda: self._search_section_times_worker(resolved_course, query_text, list(self.sections)))
+        term_hint = (self.calendar.term_name or "").strip() or (resolved_course.term_name or "").strip()
+        self._run_threaded(lambda: self._search_section_times_worker(resolved_course, query_text, term_hint, list(self.sections)))
 
-    def _search_section_times_worker(self, course_option: CourseOption, query_text: str, sections: List[Tuple[int, str]]):
+    def _search_section_times_worker(self, course_option: CourseOption, query_text: str, term_hint: str, sections: List[Tuple[int, str]]):
         try:
-            autofilled = self.banner_client.autofill_section_meetings_for_query(query_text, course_option.term_name, sections)
+            resolved_term = self.banner_client.resolve_term_code(term_hint)
+            if not resolved_term:
+                raise ValueError(
+                    f"Could not map semester term '{term_hint or '(empty)'}' to a Banner term code. Try reloading semester and selecting the correct term."
+                )
+            autofilled = self.banner_client.autofill_section_meetings_for_query(query_text, term_hint, sections)
             if not autofilled:
                 raise ValueError(
-                    f"No Banner section times were found for {query_text}."
+                    f"No Banner section times were found for {query_text} in {term_hint or 'the selected term'}."
                 )
 
             def apply_results():
