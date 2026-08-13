@@ -30,6 +30,7 @@ from __future__ import annotations
 import configparser
 import os
 import datetime as dt
+from difflib import SequenceMatcher
 import re
 import sys
 import threading
@@ -146,6 +147,55 @@ def overlaps_days(a0: dt.date, a1: dt.date, b0: dt.date, b1: dt.date) -> int:
     return (end - start).days + 1
 
 
+def normalize_banner_text(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", " ", value.upper()).strip()
+
+
+def parse_banner_course_code(course: CourseOption) -> Optional[Tuple[str, str]]:
+    return parse_banner_course_query(course.course_code) or parse_banner_course_query(course.name)
+
+
+def parse_banner_course_query(value: str) -> Optional[Tuple[str, str]]:
+    candidate = str(value or "").strip().upper()
+    if not candidate:
+        return None
+    match = re.search(r"\b([A-Z]{2,10})\s*[- ]?\s*([0-9]{3,4}[A-Z]?)\b", candidate)
+    if match:
+        return match.group(1), match.group(2)
+    match = re.search(r"\b([A-Z]{2,10})\s+([0-9]{3,4}[A-Z]?)\b", candidate)
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
+
+def parse_banner_time(value: object) -> Optional[dt.time]:
+    value = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}", value):
+        return None
+    hour = int(value[:2])
+    minute = int(value[2:])
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return dt.time(hour=hour, minute=minute)
+    return None
+
+
+def banner_weekdays_from_meeting_time(meeting_time: dict) -> List[int]:
+    day_fields = [
+        (0, "monday"),
+        (1, "tuesday"),
+        (2, "wednesday"),
+        (3, "thursday"),
+        (4, "friday"),
+        (5, "saturday"),
+        (6, "sunday"),
+    ]
+    weekdays: List[int] = []
+    for weekday, key in day_fields:
+        if meeting_time.get(key) or meeting_time.get(f"{key}Flag") or meeting_time.get(f"{key}_flag"):
+            weekdays.append(weekday)
+    return weekdays
+
+
 # -----------------------------
 # Data models
 # -----------------------------
@@ -154,7 +204,7 @@ def overlaps_days(a0: dt.date, a1: dt.date, b0: dt.date, b1: dt.date) -> int:
 class CanvasConfig:
     base_url: str
     api_key: str
-    course_id: str
+    course_id: Optional[str] = None
 
 
 @dataclass
@@ -167,6 +217,24 @@ class SemesterConfig:
 class TimeConfig:
     timezone: str
     due_time: dt.time
+
+
+@dataclass
+class CourseOption:
+    id: int
+    name: str
+    course_code: str = ""
+    term_name: str = ""
+    workflow_state: str = ""
+
+    def label(self) -> str:
+        parts = [self.name]
+        if self.course_code:
+            parts.append(self.course_code)
+        if self.term_name:
+            parts.append(self.term_name)
+        parts.append(f"ID {self.id}")
+        return " | ".join(part for part in parts if part)
 
 
 @dataclass
@@ -583,9 +651,17 @@ def scrape_semester_calendar(url: str, anchor: str) -> SemesterCalendar:
 class CanvasClient:
     def __init__(self, cfg: CanvasConfig):
         self.base_url = cfg.base_url.rstrip("/")
-        self.course_id = cfg.course_id
+        self.course_id = str(cfg.course_id).strip() if cfg.course_id else None
         self.s = requests.Session()
         self.s.headers.update({"Authorization": f"Bearer {cfg.api_key}"})
+
+    def set_course_id(self, course_id: Optional[str]) -> None:
+        self.course_id = str(course_id).strip() if course_id else None
+
+    def _require_course_id(self) -> str:
+        if not self.course_id:
+            raise ValueError("No Canvas course is selected.")
+        return self.course_id
 
     def _url(self, path: str) -> str:
         if not path.startswith("/"):
@@ -612,7 +688,8 @@ class CanvasClient:
         return out
 
     def list_assignments(self) -> List[Assignment]:
-        url = self._url(f"/api/v1/courses/{self.course_id}/assignments")
+        course_id = self._require_course_id()
+        url = self._url(f"/api/v1/courses/{course_id}/assignments")
         data = self._paginate(url, params={"per_page": 100, "include[]": "overrides"})
         assignments = []
         for a in data:
@@ -625,23 +702,55 @@ class CanvasClient:
         return assignments
 
     def list_sections(self) -> List[Tuple[int, str]]:
-        url = self._url(f"/api/v1/courses/{self.course_id}/sections")
+        course_id = self._require_course_id()
+        url = self._url(f"/api/v1/courses/{course_id}/sections")
         data = self._paginate(url, params={"per_page": 100})
         return [(int(s["id"]), str(s.get("name", "")).strip()) for s in data]
 
     def get_course(self) -> dict:
         """Return course details from Canvas API for the configured course id."""
-        url = self._url(f"/api/v1/courses/{self.course_id}")
+        course_id = self._require_course_id()
+        url = self._url(f"/api/v1/courses/{course_id}")
         r = self.s.get(url, timeout=30)
         r.raise_for_status()
         return r.json()
 
+    def list_courses(self) -> List[CourseOption]:
+        url = self._url("/api/v1/courses")
+        data = self._paginate(
+            url,
+            params={
+                "per_page": 100,
+                "enrollment_state": "active",
+                "include[]": "term",
+            },
+        )
+        courses: List[CourseOption] = []
+        for course in data:
+            term_value = course.get("term") or {}
+            if isinstance(term_value, dict):
+                term_name = str(term_value.get("name", "")).strip()
+            else:
+                term_name = str(term_value).strip()
+            courses.append(
+                CourseOption(
+                    id=int(course["id"]),
+                    name=str(course.get("name", "")).strip(),
+                    course_code=str(course.get("course_code", "")).strip(),
+                    term_name=term_name,
+                    workflow_state=str(course.get("workflow_state", "")).strip(),
+                )
+            )
+        return courses
+
     def list_assignment_overrides(self, assignment_id: int) -> List[dict]:
-        url = self._url(f"/api/v1/courses/{self.course_id}/assignments/{assignment_id}/overrides")
+        course_id = self._require_course_id()
+        url = self._url(f"/api/v1/courses/{course_id}/assignments/{assignment_id}/overrides")
         return self._paginate(url, params={"per_page": 100})
 
     def create_override(self, assignment_id: int, section_id: int, due_at_iso: str) -> dict:
-        url = self._url(f"/api/v1/courses/{self.course_id}/assignments/{assignment_id}/overrides")
+        course_id = self._require_course_id()
+        url = self._url(f"/api/v1/courses/{course_id}/assignments/{assignment_id}/overrides")
         payload = {
             "assignment_override[course_section_id]": section_id,
             "assignment_override[due_at]": due_at_iso,
@@ -651,7 +760,8 @@ class CanvasClient:
         return r.json()
 
     def update_override(self, assignment_id: int, override_id: int, due_at_iso: str) -> dict:
-        url = self._url(f"/api/v1/courses/{self.course_id}/assignments/{assignment_id}/overrides/{override_id}")
+        course_id = self._require_course_id()
+        url = self._url(f"/api/v1/courses/{course_id}/assignments/{assignment_id}/overrides/{override_id}")
         payload = {
             "assignment_override[due_at]": due_at_iso,
         }
@@ -667,6 +777,241 @@ class CanvasClient:
                 self.update_override(assignment_id, int(o["id"]), due_at_iso)
                 return
         self.create_override(assignment_id, section_id, due_at_iso)
+
+
+class BannerClient:
+    def __init__(self, base_url: str = "https://selfservice.uncc.edu/StudentRegistrationSsb/ssb"):
+        self.base_url = base_url.rstrip("/")
+        self.s = requests.Session()
+        self._term_cache: Optional[List[dict]] = None
+
+    def _url(self, path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        return f"{self.base_url}{path}"
+
+    def _warm_up(self) -> None:
+        self.s.get(self._url("/term/termSelection"), params={"mode": "search"}, timeout=30)
+
+    def _json_candidates(self, urls: List[str], params: Optional[dict] = None) -> object:
+        last_error: Optional[Exception] = None
+        for url in urls:
+            try:
+                response = self.s.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+        raise RuntimeError("Banner request returned no data.")
+
+    def _fetch_terms(self) -> List[dict]:
+        if self._term_cache is not None:
+            return self._term_cache
+
+        self._warm_up()
+        data = self._json_candidates([
+            self._url("/term/getTerms"),
+            self._url("/term/getTerms?mode=search"),
+        ], params=None)
+
+        if not data:
+            data = self._json_candidates([self._url("/term/getTerms")], params={"mode": "search"})
+
+        if isinstance(data, list):
+            terms = data
+        elif isinstance(data, dict):
+            terms = (
+                data.get("data")
+                or data.get("terms")
+                or data.get("results")
+                or data.get("rows")
+                or []
+            )
+        else:
+            terms = []
+
+        self._term_cache = [term for term in terms if isinstance(term, dict)]
+        return self._term_cache
+
+    def _term_display(self, term: dict) -> str:
+        pieces = [
+            str(term.get("description") or term.get("termDesc") or term.get("label") or "").strip(),
+            str(term.get("code") or term.get("value") or term.get("term") or term.get("id") or "").strip(),
+        ]
+        return " ".join(piece for piece in pieces if piece)
+
+    def resolve_term_code(self, term_name: Optional[str]) -> Optional[str]:
+        if not term_name:
+            return None
+
+        normalized_target = normalize_banner_text(term_name)
+        exact_tokens = set(normalized_target.split())
+
+        for term in self._fetch_terms():
+            display = normalize_banner_text(self._term_display(term))
+            code = str(term.get("code") or term.get("value") or term.get("term") or term.get("id") or "").strip()
+            if not code:
+                continue
+            if normalized_target and (normalized_target == display or normalized_target in display or display in normalized_target):
+                return code
+            display_tokens = set(display.split())
+            if exact_tokens and exact_tokens <= display_tokens:
+                return code
+
+        if self._term_cache:
+            for term in self._term_cache:
+                display = self._term_display(term)
+                if normalized_target and normalized_target in normalize_banner_text(display):
+                    return str(term.get("code") or term.get("value") or term.get("term") or term.get("id") or "").strip() or None
+
+        return None
+
+    def _search_payload(self, subject: str, course_number: str, term_code: str) -> List[Tuple[str, str]]:
+        return [
+            ("txt_subject", subject),
+            ("txt_courseNumber", course_number),
+            ("txt_term", term_code),
+            ("pageOffset", "0"),
+            ("pageMaxSize", "500"),
+            ("sortColumn", "subjectDescription"),
+            ("sortDirection", "asc"),
+            ("sortOrder", "asc"),
+            ("chk_openOnly", "false"),
+        ]
+
+    def search_sections(self, subject: str, course_number: str, term_code: str) -> List[dict]:
+        self._warm_up()
+        response = self.s.post(
+            self._url("/searchResults/searchResults"),
+            data=self._search_payload(subject, course_number, term_code),
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        try:
+            data = response.json()
+        except Exception:
+            text = response.text
+            match = re.search(r"window\.sectionResultsCollection\s*=\s*(\{.*?\});", text, re.DOTALL)
+            if not match:
+                raise ValueError("Banner search response did not include JSON results.")
+            import json
+
+            data = json.loads(match.group(1))
+
+        if isinstance(data, dict):
+            for key in ("data", "rows", "results", "items"):
+                rows = data.get(key)
+                if isinstance(rows, list):
+                    return [row for row in rows if isinstance(row, dict)]
+
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+
+        return []
+
+    def _meeting_time_from_row(self, row: dict) -> Optional[Tuple[List[int], dt.time]]:
+        meeting_times: List[dict] = []
+        for faculty_entry in row.get("meetingsFaculty", []) or []:
+            if not isinstance(faculty_entry, dict):
+                continue
+            mt = faculty_entry.get("meetingTime")
+            if isinstance(mt, list):
+                meeting_times.extend([entry for entry in mt if isinstance(entry, dict)])
+            elif isinstance(mt, dict):
+                meeting_times.append(mt)
+
+        best: Optional[Tuple[int, dt.time, List[int]]] = None
+        for meeting_time in meeting_times:
+            weekdays = banner_weekdays_from_meeting_time(meeting_time)
+            begin_time = parse_banner_time(
+                meeting_time.get("beginTime")
+                or meeting_time.get("startTime")
+                or meeting_time.get("begin")
+                or meeting_time.get("start")
+            )
+            if not weekdays or not begin_time:
+                continue
+            score = (-len(weekdays), begin_time.hour * 60 + begin_time.minute)
+            if best is None or score < (best[0], best[1].hour * 60 + best[1].minute):
+                best = (score[0], begin_time, weekdays)
+
+        if best is None:
+            return None
+        return best[2], best[1]
+
+    def _row_section_number(self, row: dict) -> str:
+        for key in ("sequenceNumber", "sequence_number", "sectionNumber", "section_number", "courseReferenceNumber", "course_reference_number"):
+            value = str(row.get(key, "")).strip()
+            if value:
+                return value
+        return ""
+
+    def _canvas_section_suffix(self, section_name: str) -> Optional[str]:
+        match = re.search(r"(?:-|\b)(\d{3,4}[A-Z]?)\b", section_name)
+        if match:
+            return match.group(1)
+        return None
+
+    def autofill_section_meetings(self, course: CourseOption, sections: List[Tuple[int, str]]) -> Dict[int, SectionMeeting]:
+        parsed = parse_banner_course_code(course)
+        if not parsed:
+            return {}
+
+        return self.autofill_section_meetings_for_query(f"{parsed[0]} {parsed[1]}", course.term_name, sections)
+
+    def autofill_section_meetings_for_query(self, query_text: str, term_name: Optional[str], sections: List[Tuple[int, str]]) -> Dict[int, SectionMeeting]:
+        parsed = parse_banner_course_query(query_text)
+        if not parsed:
+            return {}
+
+        subject, course_number = parsed
+        term_code = self.resolve_term_code(term_name)
+        if not term_code:
+            return {}
+
+        rows = self.search_sections(subject, course_number, term_code)
+        if not rows:
+            return {}
+
+        rows_by_section: Dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            section_number = self._row_section_number(row)
+            if section_number:
+                rows_by_section[section_number] = row
+
+        if not rows_by_section:
+            return {}
+
+        autofilled: Dict[int, SectionMeeting] = {}
+        for section_id, section_name in sections:
+            section_suffix = self._canvas_section_suffix(section_name)
+            candidate_row: Optional[dict] = None
+            if section_suffix and section_suffix in rows_by_section:
+                candidate_row = rows_by_section[section_suffix]
+            elif len(rows_by_section) == 1:
+                candidate_row = next(iter(rows_by_section.values()))
+
+            if not candidate_row:
+                continue
+
+            parsed_time = self._meeting_time_from_row(candidate_row)
+            if not parsed_time:
+                continue
+
+            weekdays, start_time = parsed_time
+            autofilled[section_id] = SectionMeeting(
+                section_id=section_id,
+                section_name=section_name,
+                weekdays=weekdays,
+                start_time=start_time,
+            )
+
+        return autofilled
 
 
 # -----------------------------
@@ -977,37 +1322,32 @@ class ConfigDialog(tk.Toplevel):
         self.api_key_e.grid(row=2, column=1, sticky="w", pady=(6, 0))
         self.api_key_e.insert(0, cfg.get("canvas", "api_key", fallback=""))
 
-        ttk.Label(frm, text="Course ID:").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        self.course_id_e = ttk.Entry(frm, width=20)
-        self.course_id_e.grid(row=3, column=1, sticky="w", pady=(6, 0))
-        self.course_id_e.insert(0, cfg.get("canvas", "course_id", fallback=""))
-
         # Semester
-        ttk.Label(frm, text="Calendar URL:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frm, text="Calendar URL:").grid(row=3, column=0, sticky="w", pady=(8, 0))
         self.cal_url_e = ttk.Entry(frm, width=60)
-        self.cal_url_e.grid(row=4, column=1, sticky="w", pady=(8, 0))
+        self.cal_url_e.grid(row=3, column=1, sticky="w", pady=(8, 0))
         self.cal_url_e.insert(0, cfg.get("semester", "calendar_url", fallback=""))
 
-        ttk.Label(frm, text="Anchor:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frm, text="Anchor:").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.anchor_e = ttk.Entry(frm, width=40)
-        self.anchor_e.grid(row=5, column=1, sticky="w", pady=(6, 0))
+        self.anchor_e.grid(row=4, column=1, sticky="w", pady=(6, 0))
         self.anchor_e.insert(0, cfg.get("semester", "anchor", fallback=""))
 
         # lab_base is auto-detected; not editable via this dialog
 
         # Time
-        ttk.Label(frm, text="Timezone (IANA):").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frm, text="Timezone (IANA):").grid(row=6, column=0, sticky="w", pady=(8, 0))
         self.tz_e = ttk.Entry(frm, width=40)
-        self.tz_e.grid(row=7, column=1, sticky="w", pady=(8, 0))
+        self.tz_e.grid(row=6, column=1, sticky="w", pady=(8, 0))
         self.tz_e.insert(0, cfg.get("time", "timezone", fallback="America/New_York"))
 
-        ttk.Label(frm, text="Due time (HH:MM):").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frm, text="Due time (HH:MM):").grid(row=7, column=0, sticky="w", pady=(6, 0))
         self.due_time_e = ttk.Entry(frm, width=10)
-        self.due_time_e.grid(row=8, column=1, sticky="w", pady=(6, 0))
+        self.due_time_e.grid(row=7, column=1, sticky="w", pady=(6, 0))
         self.due_time_e.insert(0, cfg.get("time", "due_time_hhmm", fallback="23:59"))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(btns, text="Cancel", command=self._cancel).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(btns, text="Save", command=self._save).grid(row=0, column=1)
 
@@ -1023,17 +1363,14 @@ class ConfigDialog(tk.Toplevel):
         try:
             base_url = self.base_url_e.get().strip()
             api_key = self.api_key_e.get().strip()
-            course_id = self.course_id_e.get().strip()
             cal_url = self.cal_url_e.get().strip()
             anchor = self.anchor_e.get().strip()
             tz = self.tz_e.get().strip()
             due_time = self.due_time_e.get().strip()
-            tz = self.tz_e.get().strip()
-            due_time = self.due_time_e.get().strip()
 
             # basic validation
-            if not base_url or not api_key or not course_id:
-                raise ValueError("Canvas base_url, api_key and course_id are required.")
+            if not base_url or not api_key:
+                raise ValueError("Canvas base_url and api_key are required.")
             # validate due_time
             _ = parse_hhmm(due_time)
 
@@ -1041,8 +1378,12 @@ class ConfigDialog(tk.Toplevel):
             cfg["canvas"] = {
                 "base_url": base_url,
                 "api_key": api_key,
-                "course_id": course_id,
             }
+            existing = configparser.ConfigParser()
+            existing.read(self.config_path)
+            saved_course_id = existing.get("canvas", "course_id", fallback="").strip()
+            if saved_course_id:
+                cfg["canvas"]["course_id"] = saved_course_id
             cfg["semester"] = {
                 "calendar_url": cal_url,
                 "anchor": anchor,
@@ -1084,6 +1425,13 @@ class App(tk.Tk):
         self.tz: Optional[ZoneInfo] = None
         self.calendar: Optional[SemesterCalendar] = None
         self.client: Optional[CanvasClient] = None
+        self.banner_client: BannerClient = BannerClient()
+        self.banner_course_code_var = tk.StringVar(value="(not estimated)")
+        self.banner_search_var = tk.StringVar(value="")
+
+        self.course_options: List[CourseOption] = []
+        self.course_options_by_id: Dict[str, CourseOption] = {}
+        self.course_options_by_label: Dict[str, CourseOption] = {}
 
         self.sections: List[Tuple[int, str]] = []
         self.section_meetings: Dict[int, SectionMeeting] = {}
@@ -1128,24 +1476,33 @@ class App(tk.Tk):
         ttk.Label(ctrl, text="Course:").grid(row=5, column=0, sticky="w", pady=(8, 0))
         self.course_var = tk.StringVar(value="(not loaded)")
         ttk.Label(ctrl, textvariable=self.course_var).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        
-        # Course selector dropdown (for switching between previously configured courses)
-        ttk.Label(ctrl, text="Switch to course:").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        self.course_selector = ttk.Combobox(ctrl, width=60, state="readonly")
-        self.course_selector.grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(ctrl, text="Estimated Banner course:").grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(ctrl, textvariable=self.banner_course_code_var).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(ctrl, text="Banner search term (editable):").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        self.banner_search_entry = ttk.Entry(ctrl, width=30, textvariable=self.banner_search_var)
+        self.banner_search_entry.grid(row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        # Course selector dropdown with fuzzy filtering against the API-backed list.
+        ttk.Label(ctrl, text="Course search:").grid(row=8, column=0, sticky="w", pady=(8, 0))
+        self.course_selector = ttk.Combobox(ctrl, width=72, state="normal")
+        self.course_selector.grid(row=8, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.course_selector.bind("<KeyRelease>", self._on_course_query_changed)
         self.course_selector.bind("<<ComboboxSelected>>", self._on_course_selected)
 
         # Lab numbering is auto-detected (Lab 0 if present); no manual radio control.
 
         btnrow = ttk.Frame(ctrl)
-        btnrow.grid(row=0, column=2, rowspan=7, sticky="e", padx=(20, 0))
+        btnrow.grid(row=0, column=2, rowspan=9, sticky="e", padx=(20, 0))
         ttk.Button(btnrow, text="Reload semester", command=self.on_reload_semester).grid(row=0, column=0, padx=5)
         ttk.Button(btnrow, text="Load Canvas data", command=self.on_load_canvas).grid(row=0, column=1, padx=5)
-        ttk.Button(btnrow, text="Set section meeting times", command=self.on_set_meetings).grid(row=0, column=2, padx=5)
-        ttk.Button(btnrow, text="Auto-compute due dates", command=self.on_compute).grid(row=1, column=0, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Apply to Canvas", command=self.on_apply).grid(row=1, column=1, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Show skipped weeks", command=self.on_show_skipped_weeks).grid(row=1, column=2, padx=5, pady=(8, 0))
-        ttk.Button(btnrow, text="Edit config", command=self.on_edit_config).grid(row=2, column=0, padx=5, pady=(8, 0))
+        ttk.Button(btnrow, text="Search section times", command=self.on_search_section_times).grid(row=0, column=2, padx=5)
+        ttk.Button(btnrow, text="Set section meeting times", command=self.on_set_meetings).grid(row=1, column=0, padx=5, pady=(8, 0))
+        ttk.Button(btnrow, text="Auto-compute due dates", command=self.on_compute).grid(row=1, column=1, padx=5, pady=(8, 0))
+        ttk.Button(btnrow, text="Apply to Canvas", command=self.on_apply).grid(row=1, column=2, padx=5, pady=(8, 0))
+        ttk.Button(btnrow, text="Show skipped weeks", command=self.on_show_skipped_weeks).grid(row=2, column=0, padx=5, pady=(8, 0))
+        ttk.Button(btnrow, text="Edit config", command=self.on_edit_config).grid(row=2, column=1, padx=5, pady=(8, 0))
 
         # Status
         self.status_var = tk.StringVar(value="Ready.")
@@ -1186,90 +1543,271 @@ class App(tk.Tk):
         self.status_var.set(s)
         self.update_idletasks()
 
-    def _get_configured_course_ids(self) -> Dict[str, str]:
-        """Get dict of course IDs to course names that have section meetings configured"""
-        meetings_config_path = "section_meetings.ini"
-        if not os.path.exists(meetings_config_path):
-            return {}
-        
-        try:
-            cfg = configparser.ConfigParser()
-            cfg.read(meetings_config_path)
-            
-            course_data = {}
-            for section_key in cfg.sections():
-                if section_key.endswith("_metadata"):
-                    # Extract course_id from "course_{course_id}_metadata"
-                    if section_key.startswith("course_"):
-                        parts = section_key.split("_")
-                        if len(parts) >= 3:
-                            course_id = parts[1]
-                            course_name = cfg.get(section_key, "course_name", fallback=f"Course {course_id}")
-                            course_data[course_id] = course_name
-                elif section_key.startswith("course_"):
-                    # Legacy support: extract from section entries if no metadata
-                    parts = section_key.split("_")
-                    if len(parts) >= 4 and parts[0] == "course" and parts[2] == "section":
-                        course_id = parts[1]
-                        if course_id not in course_data:
-                            course_data[course_id] = f"Course {course_id}"
-            
-            return course_data
-        except Exception as e:
-            print(f"Warning: Failed to get configured course IDs: {e}")
-            return {}
-    
-    def _update_course_selector(self):
-        """Update the course selector dropdown with available course IDs and names"""
-        course_data = self._get_configured_course_ids()
-        
-        # Create display strings: "Course Name (ID: course_id)"
-        display_values = []
-        self.course_id_map = {}  # Map display string to course ID
-        
-        for course_id, course_name in sorted(course_data.items(), key=lambda x: x[1]):
-            display_str = f"{course_name} (ID: {course_id})"
-            display_values.append(display_str)
-            self.course_id_map[display_str] = course_id
-        
-        self.course_selector['values'] = display_values
-        
-        # Set current course as selected if it's in the list
-        if self.canvas_cfg and self.canvas_cfg.course_id in course_data:
-            current_display = f"{course_data[self.canvas_cfg.course_id]} (ID: {self.canvas_cfg.course_id})"
-            self.course_selector.set(current_display)
-        elif display_values:
-            self.course_selector.set('')
-    
-    def _on_course_selected(self, event):
-        """Handle course selection from dropdown"""
-        selected_display = self.course_selector.get()
-        if not selected_display or not hasattr(self, 'course_id_map'):
+    def _estimated_banner_course_text(self, course: Optional[CourseOption]) -> str:
+        if not course:
+            return "(not estimated)"
+        parsed = parse_banner_course_code(course)
+        if not parsed:
+            return "(could not estimate)"
+        subject, course_number = parsed
+        return f"{subject} {course_number}"
+
+    def _update_banner_course_display(self, course: Optional[CourseOption]) -> None:
+        self.banner_course_code_var.set(self._estimated_banner_course_text(course))
+
+    def _update_banner_search_term(self, course: Optional[CourseOption]) -> None:
+        if not course:
+            self.banner_search_var.set("")
             return
-        
-        # Extract course ID from display string
-        selected_course_id = self.course_id_map.get(selected_display)
-        if not selected_course_id:
+        estimated = self._estimated_banner_course_text(course)
+        if estimated not in {"(not estimated)", "(could not estimate)"}:
+            self.banner_search_var.set(estimated)
+
+    def _normalize_course_query(self, text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+    def _course_search_blob(self, course: CourseOption) -> str:
+        return " ".join(part for part in (course.name, course.course_code, course.term_name, str(course.id)) if part)
+
+    def _score_course_option(self, course: CourseOption, query: str) -> float:
+        normalized_query = self._normalize_course_query(query)
+        if not normalized_query:
+            return 0.0
+
+        haystack = self._normalize_course_query(self._course_search_blob(course))
+        score = SequenceMatcher(None, normalized_query, haystack).ratio()
+        if normalized_query in haystack:
+            score += 0.8
+        if self._normalize_course_query(course.name).startswith(normalized_query):
+            score += 0.5
+        if course.course_code and self._normalize_course_query(course.course_code).startswith(normalized_query):
+            score += 0.7
+        for token in normalized_query.split():
+            if token in haystack:
+                score += 0.15
+        if str(course.id) == query.strip():
+            score += 1.0
+        return score
+
+    def _sorted_course_options(self, query: str = "") -> List[CourseOption]:
+        if not self.course_options:
+            return []
+
+        query = query.strip()
+        if not query:
+            return sorted(
+                self.course_options,
+                key=lambda course: (
+                    self._normalize_course_query(course.term_name),
+                    self._normalize_course_query(course.course_code),
+                    self._normalize_course_query(course.name),
+                    course.id,
+                ),
+            )
+
+        scored: List[Tuple[float, CourseOption]] = []
+        for course in self.course_options:
+            score = self._score_course_option(course, query)
+            if score > 0:
+                scored.append((score, course))
+
+        if not scored:
+            return sorted(
+                self.course_options,
+                key=lambda course: (
+                    self._normalize_course_query(course.term_name),
+                    self._normalize_course_query(course.course_code),
+                    self._normalize_course_query(course.name),
+                    course.id,
+                ),
+            )
+
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                self._normalize_course_query(item[1].term_name),
+                self._normalize_course_query(item[1].name),
+                item[1].id,
+            )
+        )
+        return [course for _, course in scored]
+
+    def _update_course_selector(self, query: str = ""):
+        if not hasattr(self, "course_selector"):
             return
-        
-        # Check if this is different from current course
-        if self.canvas_cfg and selected_course_id == self.canvas_cfg.course_id:
-            return
-        
-        # Update the course_id in canvas config and reload
-        try:
-            cfg = configparser.ConfigParser()
+
+        active_query = query.strip()
+        matches = self._sorted_course_options(active_query)
+        labels = [course.label() for course in matches[:75]]
+        self.course_selector["values"] = labels
+
+    def _persist_selected_course_id(self, course_id: Optional[str]) -> None:
+        cfg = configparser.ConfigParser()
+        if os.path.exists(self.config_path):
             cfg.read(self.config_path)
-            cfg.set("canvas", "course_id", selected_course_id)
-            
-            with open(self.config_path, 'w', encoding='utf-8') as fh:
-                cfg.write(fh)
-            
-            # Reload config to apply the change
-            self._load_config_and_init()
-            self._set_status(f"Switched to course ID: {selected_course_id}")
+        if "canvas" not in cfg:
+            cfg["canvas"] = {}
+        if course_id:
+            cfg["canvas"]["course_id"] = str(course_id)
+        else:
+            cfg["canvas"].pop("course_id", None)
+
+        with open(self.config_path, "w", encoding="utf-8") as fh:
+            cfg.write(fh)
+
+    def _set_active_course(self, course_id: Optional[str], persist: bool = True) -> None:
+        course_key = str(course_id).strip() if course_id else ""
+
+        self.suggestions = []
+        self.unschedulable_assignment_ids = set()
+        self.sections = []
+        self.assignments = []
+        self.course_name = None
+        self._refresh_tree_empty()
+
+        if not course_key:
+            if self.canvas_cfg:
+                self.canvas_cfg.course_id = None
+            if self.client:
+                self.client.set_course_id(None)
+            self.course_var.set("(not selected)")
+            self._update_banner_course_display(None)
+            self._update_banner_search_term(None)
+            self.course_selector.set("")
+            self.section_meetings.clear()
+            self._refresh_meetings_display()
+            if persist:
+                self._persist_selected_course_id(None)
+            self._set_status("No Canvas course selected.")
+            return
+
+        course_option = self.course_options_by_id.get(course_key)
+        display = course_option.label() if course_option else f"Course ID {course_key}"
+
+        if self.canvas_cfg:
+            self.canvas_cfg.course_id = course_key
+        if self.client:
+            self.client.set_course_id(course_key)
+
+        self.course_var.set(display)
+        self.course_selector.set(display)
+        self._update_banner_course_display(course_option)
+        self._update_banner_search_term(course_option)
+        self._load_section_meetings()
+
+        if persist:
+            self._persist_selected_course_id(course_key)
+
+        self._set_status(f"Selected {display}.")
+
+    def _on_course_query_changed(self, event):
+        if getattr(self, "_course_selector_refreshing", False):
+            return
+        self._update_course_selector(self.course_selector.get())
+
+    def _on_course_selected(self, event=None):
+        selected_text = self.course_selector.get().strip()
+        if not selected_text:
+            return
+
+        course_option = self.course_options_by_label.get(selected_text)
+        if not course_option and selected_text.isdigit():
+            course_option = self.course_options_by_id.get(selected_text)
+
+        if not course_option:
+            ranked = self._sorted_course_options(selected_text)
+            if ranked:
+                top = ranked[0]
+                if self._score_course_option(top, selected_text) >= 0.5:
+                    course_option = top
+
+        if not course_option:
+            return
+
+        if self.canvas_cfg and self.canvas_cfg.course_id == str(course_option.id):
+            self.course_selector.set(course_option.label())
+            return
+
+        self._set_active_course(str(course_option.id))
+
+    def _load_courses_async(self):
+        if not self.client:
+            return
+        self._set_status("Loading Canvas course list...")
+        self._run_threaded(self._load_courses_worker)
+
+    def _load_courses_worker(self):
+        try:
+            courses = self.client.list_courses()
+            self.after(0, lambda courses=courses: self._apply_loaded_courses(courses))
         except Exception as e:
-            messagebox.showerror("Course switch error", f"Failed to switch course: {e}")
+            self.after(0, lambda e=e: messagebox.showerror("Course list error", str(e)))
+            self.after(0, lambda: self._set_status("Failed to load Canvas course list."))
+
+    def _apply_loaded_courses(self, courses: List[CourseOption]):
+        self.course_options = courses
+        self.course_options_by_id = {str(course.id): course for course in courses}
+        self.course_options_by_label = {course.label(): course for course in courses}
+
+        self._update_course_selector()
+
+        if self.canvas_cfg and self.canvas_cfg.course_id:
+            current_course = self.course_options_by_id.get(str(self.canvas_cfg.course_id))
+            if current_course:
+                self.course_selector.set(current_course.label())
+                self.course_var.set(current_course.label())
+                self._update_banner_course_display(current_course)
+                self._update_banner_search_term(current_course)
+                self._load_section_meetings()
+            else:
+                self.course_selector.set("")
+                self.course_var.set("(selected course not found)")
+                self._update_banner_course_display(None)
+                self._update_banner_search_term(None)
+        elif len(courses) == 1:
+            self._set_active_course(str(courses[0].id))
+        else:
+            self.course_selector.set("")
+            self.course_var.set("(not selected)")
+            self._update_banner_course_display(None)
+            self._update_banner_search_term(None)
+
+        self._set_status(f"Loaded {len(courses)} Canvas courses. Type to search, then pick a course.")
+
+    def _resolve_course_selection(self) -> Optional[CourseOption]:
+        selected_text = self.course_selector.get().strip()
+        if not selected_text:
+            if self.canvas_cfg and self.canvas_cfg.course_id:
+                cached_id = str(self.canvas_cfg.course_id)
+                cached_option = self.course_options_by_id.get(cached_id)
+                if cached_option:
+                    return cached_option
+                if cached_id.isdigit():
+                    return CourseOption(id=int(cached_id), name=f"Course ID {cached_id}")
+            return None
+
+        course_option = self.course_options_by_label.get(selected_text)
+        if course_option:
+            return course_option
+
+        if selected_text.isdigit():
+            course_option = self.course_options_by_id.get(selected_text)
+            if course_option:
+                return course_option
+
+        ranked = self._sorted_course_options(selected_text)
+        if ranked and self._score_course_option(ranked[0], selected_text) >= 0.5:
+            return ranked[0]
+
+        if self.canvas_cfg and self.canvas_cfg.course_id:
+            cached_id = str(self.canvas_cfg.course_id)
+            cached_option = self.course_options_by_id.get(cached_id)
+            if cached_option:
+                return cached_option
+            if cached_id.isdigit():
+                return CourseOption(id=int(cached_id), name=f"Course ID {cached_id}")
+
+        return None
 
     def _refresh_meetings_display(self):
         """Update the section meetings listbox with current meeting times"""
@@ -1301,7 +1839,6 @@ class App(tk.Tk):
                 cfg['canvas'] = {
                     'base_url': 'https://uncc.instructure.com/',
                     'api_key': '<YOUR_TOKEN_HERE>',
-                    'course_id': '12345',
                 }
                 cfg['semester'] = {
                     'calendar_url': 'https://registrar.example.edu/academic-calendar',
@@ -1326,7 +1863,7 @@ class App(tk.Tk):
             # Canvas
             base_url = cfg.get("canvas", "base_url").strip()
             api_key = cfg.get("canvas", "api_key").strip()
-            course_id = cfg.get("canvas", "course_id").strip()
+            course_id = cfg.get("canvas", "course_id", fallback="").strip() or None
             self.canvas_cfg = CanvasConfig(base_url=base_url, api_key=api_key, course_id=course_id)
 
             # Semester
@@ -1342,6 +1879,15 @@ class App(tk.Tk):
             self.tz = safe_zoneinfo(self.time_cfg.timezone)
             self.client = CanvasClient(self.canvas_cfg)
 
+            if self.canvas_cfg.course_id:
+                self.course_var.set(f"Course ID {self.canvas_cfg.course_id}")
+                self._update_banner_course_display(None)
+                self._update_banner_search_term(None)
+            else:
+                self.course_var.set("(not selected)")
+                self._update_banner_course_display(None)
+                self._update_banner_search_term(None)
+
             # Lab numbering base (optional in config under [semester] -> lab_base)
             try:
                 raw_lab_base = cfg.get("semester", "lab_base", fallback=None)
@@ -1355,9 +1901,9 @@ class App(tk.Tk):
 
             # Load saved section meeting times if available
             self._load_section_meetings()
-            
-            # Update course selector dropdown
-            self._update_course_selector()
+
+            # Load the Canvas course list in the background so the picker is searchable.
+            self._load_courses_async()
 
             self._set_status("Config loaded. Click 'Reload semester' then 'Load Canvas data'.")
         except Exception as e:
@@ -1366,7 +1912,7 @@ class App(tk.Tk):
 
     def _save_section_meetings(self):
         """Save current section meeting times to section_meetings.ini"""
-        if not self.section_meetings or not self.canvas_cfg:
+        if not self.section_meetings or not self.canvas_cfg or not self.canvas_cfg.course_id:
             return
 
         meetings_config_path = "section_meetings.ini"
@@ -1376,7 +1922,7 @@ class App(tk.Tk):
         if os.path.exists(meetings_config_path):
             cfg.read(meetings_config_path)
 
-        course_id = self.canvas_cfg.course_id
+        course_id = str(self.canvas_cfg.course_id)
         
         # Remove old sections for this course
         sections_to_remove = [s for s in cfg.sections() if s.startswith(f"course_{course_id}_section_")]
@@ -1419,7 +1965,7 @@ class App(tk.Tk):
         # Clear existing section meetings first
         self.section_meetings.clear()
         
-        if not self.canvas_cfg:
+        if not self.canvas_cfg or not self.canvas_cfg.course_id:
             self._refresh_meetings_display()
             return
         
@@ -1432,7 +1978,7 @@ class App(tk.Tk):
             cfg = configparser.ConfigParser()
             cfg.read(meetings_config_path)
             
-            course_id = self.canvas_cfg.course_id
+            course_id = str(self.canvas_cfg.course_id)
             prefix = f"course_{course_id}_section_"
 
             for section_key in cfg.sections():
@@ -1515,12 +2061,59 @@ class App(tk.Tk):
     def on_load_canvas(self):
         if not self.client:
             return
+        resolved_course = self._resolve_course_selection()
+        if not resolved_course:
+            messagebox.showinfo("No course selected", "Type to search the course list and pick a Canvas course first.")
+            return
+        if not self.canvas_cfg or self.canvas_cfg.course_id != str(resolved_course.id):
+            self._set_active_course(str(resolved_course.id))
         self._set_status("Loading Canvas sections + assignments...")
         self._run_threaded(self._load_canvas_worker)
 
     def on_edit_config(self):
         dlg = ConfigDialog(self, self.config_path)
         self.wait_window(dlg)
+
+    def on_search_section_times(self):
+        if not self.client:
+            return
+
+        resolved_course = self._resolve_course_selection()
+        if not resolved_course:
+            messagebox.showerror("No course selected", "Type to search the course list and pick a Canvas course first.")
+            return
+        if not self.sections:
+            messagebox.showerror("No sections loaded", "Load Canvas data first, then search for section times.")
+            return
+
+        query_text = self.banner_search_var.get().strip()
+        parsed_query = parse_banner_course_query(query_text)
+        if not parsed_query:
+            messagebox.showerror("Invalid Banner search term", "Enter a subject and course number, for example MATH 1101.")
+            return
+
+        self._set_status("Searching Banner for section times...")
+        self._run_threaded(lambda: self._search_section_times_worker(resolved_course, query_text, list(self.sections)))
+
+    def _search_section_times_worker(self, course_option: CourseOption, query_text: str, sections: List[Tuple[int, str]]):
+        try:
+            autofilled = self.banner_client.autofill_section_meetings_for_query(query_text, course_option.term_name, sections)
+            if not autofilled:
+                raise ValueError(
+                    f"No Banner section times were found for {query_text}."
+                )
+
+            def apply_results():
+                for section_id, meeting in autofilled.items():
+                    self.section_meetings[section_id] = meeting
+                self._save_section_meetings()
+                self._refresh_meetings_display()
+                self._set_status(f"Loaded {len(autofilled)} section meeting time(s) from Banner.")
+
+            self.after(0, apply_results)
+        except Exception as e:
+            self.after(0, lambda e=e: messagebox.showerror("Banner search error", str(e)))
+            self.after(0, lambda: self._set_status("Banner section search failed."))
 
     def _load_canvas_worker(self):
         try:
@@ -1561,6 +2154,7 @@ class App(tk.Tk):
             # Reload section meetings for this course (don't clear them)
             # They were already loaded in _load_config_and_init or when switching courses
             self.after(0, self._refresh_tree_empty)
+            self.after(0, self._refresh_meetings_display)
             # update course title label
             self.after(0, lambda: self.course_var.set(course_name))
             # Update course selector in case we have a new course name

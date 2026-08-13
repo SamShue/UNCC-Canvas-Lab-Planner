@@ -15,6 +15,8 @@ per-section due dates (applied as Canvas assignment overrides).
 - Lab-numbering is auto-detected: the tool will use `Lab 0` as the base if any assignment named
   `Lab 0` exists; otherwise it defaults to base 1. You can also set a fixed `lab_base` manually
   by editing `config.ini` (see Configuration below).
+- Uses your Canvas API key to load a searchable course dropdown, so you no longer need to type
+  a Canvas course ID by hand.
 - Debug output can be enabled via the `CANVAS_LAB_PLANNER_DEBUG` environment variable.
 
 Prerequisites
@@ -76,7 +78,8 @@ Configuration
   - `[canvas]`
     - `base_url` — your Canvas URL (e.g. `https://uncc.instructure.com/`)
     - `api_key` — Canvas API token with permissions to edit assignment overrides
-    - `course_id` — Canvas course ID to operate on
+    - `course_id` — optional cached selection; the app will populate this automatically when you
+      choose a course from the dropdown
   - `[semester]`
     - `calendar_url` — registrar calendar page URL
     - `anchor` — (best-effort) anchor or section identifier used by the scraper
@@ -93,7 +96,6 @@ Example `config.ini`:
 [canvas]
 base_url = https://uncc.instructure.com/
 api_key = <YOUR_TOKEN>
-course_id = 12345
 
 [semester]
 calendar_url = https://registrar.charlotte.edu/calendars-schedules/academic-year-fall-2025-spring-2026/#spring-full-term
@@ -125,6 +127,8 @@ python main.py path\to\config.ini
 
 Typical workflow:
 - Click `Reload semester` to scrape the registrar calendar and populate Term / First day / Last day.
+- Type in the course search box, choose the Canvas course from the fuzzy-filtered dropdown, and
+  then click `Load Canvas data`. The selected course ID is saved automatically.
 - Click `Load Canvas data` to fetch sections and assignments. The tool will auto-detect `Lab 0`
   and use base 0 if present; to override detection, set `lab_base` in `config.ini` manually.
 - Click `Set section meeting times` to enter meeting days and start time for each section.
