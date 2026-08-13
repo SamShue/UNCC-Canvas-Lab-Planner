@@ -55,5 +55,8 @@ desktop.ini
 # DO NOT commit Canvas API keys
 config.ini
 
+# Section meeting times (can vary per user/instructor)
+section_meetings.ini
+
 # Optional: allow committing an example config
 !config.example.ini

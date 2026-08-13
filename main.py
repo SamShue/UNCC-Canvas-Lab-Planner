@@ -256,6 +256,11 @@ class SemesterCalendar:
 class Assignment:
     id: int
     name: str
+    overrides: List[dict] = None  # Store assignment overrides with due dates
+    
+    def __post_init__(self):
+        if self.overrides is None:
+            self.overrides = []
 
 
 @dataclass
@@ -608,8 +613,16 @@ class CanvasClient:
 
     def list_assignments(self) -> List[Assignment]:
         url = self._url(f"/api/v1/courses/{self.course_id}/assignments")
-        data = self._paginate(url, params={"per_page": 100})
-        return [Assignment(id=int(a["id"]), name=str(a.get("name", "")).strip()) for a in data]
+        data = self._paginate(url, params={"per_page": 100, "include[]": "overrides"})
+        assignments = []
+        for a in data:
+            overrides = a.get("overrides", [])
+            assignments.append(Assignment(
+                id=int(a["id"]), 
+                name=str(a.get("name", "")).strip(),
+                overrides=overrides
+            ))
+        return assignments
 
     def list_sections(self) -> List[Tuple[int, str]]:
         url = self._url(f"/api/v1/courses/{self.course_id}/sections")
@@ -785,7 +798,7 @@ def build_due_suggestions(
 # -----------------------------
 
 class SectionMeetingDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Tk, section_id: int, section_name: str):
+    def __init__(self, parent: tk.Tk, section_id: int, section_name: str, existing_meeting: Optional[SectionMeeting] = None):
         super().__init__(parent)
         self.title(f"Meeting time: {section_name}")
         self.resizable(False, False)
@@ -801,12 +814,25 @@ class SectionMeetingDialog(tk.Toplevel):
         ttk.Label(frm, text="Meeting days (e.g., M W F or Tu Th):").grid(row=1, column=0, sticky="w")
         self.days_entry = ttk.Entry(frm, width=24)
         self.days_entry.grid(row=1, column=1, sticky="w", padx=(8, 0))
-        self.days_entry.insert(0, "M W")
+        
+        # Pre-populate with existing data if available
+        if existing_meeting:
+            # Convert weekday numbers to day abbreviations
+            day_map = {0: "M", 1: "T", 2: "W", 3: "R", 4: "F", 5: "S", 6: "U"}
+            days_str = " ".join(day_map.get(wd, str(wd)) for wd in existing_meeting.weekdays)
+            self.days_entry.insert(0, days_str)
+        else:
+            self.days_entry.insert(0, "M W")
 
         ttk.Label(frm, text="Start time (24h HH:MM):").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.time_entry = ttk.Entry(frm, width=10)
         self.time_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        self.time_entry.insert(0, "09:00")
+        
+        # Pre-populate with existing time if available
+        if existing_meeting:
+            self.time_entry.insert(0, existing_meeting.start_time.strftime("%H:%M"))
+        else:
+            self.time_entry.insert(0, "09:00")
 
         btns = ttk.Frame(frm)
         btns.grid(row=3, column=0, columnspan=4, sticky="e", pady=(12, 0))
@@ -1061,6 +1087,7 @@ class App(tk.Tk):
         self.canvas_cfg: Optional[CanvasConfig] = None
         self.sem_cfg: Optional[SemesterConfig] = None
         self.time_cfg: Optional[TimeConfig] = None
+        self.course_name: Optional[str] = None  # Store course name from Canvas
 
         self.tz: Optional[ZoneInfo] = None
         self.calendar: Optional[SemesterCalendar] = None
@@ -1108,11 +1135,17 @@ class App(tk.Tk):
         ttk.Label(ctrl, text="Course:").grid(row=5, column=0, sticky="w", pady=(8, 0))
         self.course_var = tk.StringVar(value="(not loaded)")
         ttk.Label(ctrl, textvariable=self.course_var).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        
+        # Course selector dropdown (for switching between previously configured courses)
+        ttk.Label(ctrl, text="Switch to course:").grid(row=6, column=0, sticky="w", pady=(8, 0))
+        self.course_selector = ttk.Combobox(ctrl, width=60, state="readonly")
+        self.course_selector.grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        self.course_selector.bind("<<ComboboxSelected>>", self._on_course_selected)
 
         # Lab numbering is auto-detected (Lab 0 if present); no manual radio control.
 
         btnrow = ttk.Frame(ctrl)
-        btnrow.grid(row=0, column=2, rowspan=6, sticky="e", padx=(20, 0))
+        btnrow.grid(row=0, column=2, rowspan=7, sticky="e", padx=(20, 0))
         ttk.Button(btnrow, text="Reload semester", command=self.on_reload_semester).grid(row=0, column=0, padx=5)
         ttk.Button(btnrow, text="Load Canvas data", command=self.on_load_canvas).grid(row=0, column=1, padx=5)
         ttk.Button(btnrow, text="Set section meeting times", command=self.on_set_meetings).grid(row=0, column=2, padx=5)
@@ -1125,12 +1158,22 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(top, textvariable=self.status_var).pack(fill="x", padx=8, pady=(0, 8))
 
+        # Section meetings display
+        meetings_frame = ttk.LabelFrame(top, text="Section Meeting Times", padding=10)
+        meetings_frame.pack(fill="x", padx=5, pady=(0, 5))
+        
+        self.meetings_listbox = tk.Listbox(meetings_frame, height=4, font=("Consolas", 9))
+        self.meetings_listbox.pack(fill="both", expand=True)
+
         # Treeview
-        cols = ("assignment", "preview")
-        self.tree = ttk.Treeview(top, columns=cols, show="headings", height=22)
+        cols = ("assignment", "existing", "preview")
+        self.tree = ttk.Treeview(top, columns=cols, show="headings", height=18)
         self.tree.heading("assignment", text="Assignment")
+        self.tree.heading("existing", text="Current Canvas Due Dates")
         self.tree.heading("preview", text="Auto Due Preview (per section)")
-        self.tree.column("assignment", width=420, anchor="w")
+        self.tree.column("assignment", width=280, anchor="w")
+        self.tree.column("existing", width=380, anchor="w")
+        self.tree.column("preview", width=380, anchor="w")
         self.tree.column("preview", width=640, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=5, pady=5)
 
@@ -1148,6 +1191,112 @@ class App(tk.Tk):
     def _set_status(self, s: str):
         self.status_var.set(s)
         self.update_idletasks()
+
+    def _get_configured_course_ids(self) -> Dict[str, str]:
+        """Get dict of course IDs to course names that have section meetings configured"""
+        meetings_config_path = "section_meetings.ini"
+        if not os.path.exists(meetings_config_path):
+            return {}
+        
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(meetings_config_path)
+            
+            course_data = {}
+            for section_key in cfg.sections():
+                if section_key.endswith("_metadata"):
+                    # Extract course_id from "course_{course_id}_metadata"
+                    if section_key.startswith("course_"):
+                        parts = section_key.split("_")
+                        if len(parts) >= 3:
+                            course_id = parts[1]
+                            course_name = cfg.get(section_key, "course_name", fallback=f"Course {course_id}")
+                            course_data[course_id] = course_name
+                elif section_key.startswith("course_"):
+                    # Legacy support: extract from section entries if no metadata
+                    parts = section_key.split("_")
+                    if len(parts) >= 4 and parts[0] == "course" and parts[2] == "section":
+                        course_id = parts[1]
+                        if course_id not in course_data:
+                            course_data[course_id] = f"Course {course_id}"
+            
+            return course_data
+        except Exception as e:
+            print(f"Warning: Failed to get configured course IDs: {e}")
+            return {}
+    
+    def _update_course_selector(self):
+        """Update the course selector dropdown with available course IDs and names"""
+        course_data = self._get_configured_course_ids()
+        
+        # Create display strings: "Course Name (ID: course_id)"
+        display_values = []
+        self.course_id_map = {}  # Map display string to course ID
+        
+        for course_id, course_name in sorted(course_data.items(), key=lambda x: x[1]):
+            display_str = f"{course_name} (ID: {course_id})"
+            display_values.append(display_str)
+            self.course_id_map[display_str] = course_id
+        
+        self.course_selector['values'] = display_values
+        
+        # Set current course as selected if it's in the list
+        if self.canvas_cfg and self.canvas_cfg.course_id in course_data:
+            current_display = f"{course_data[self.canvas_cfg.course_id]} (ID: {self.canvas_cfg.course_id})"
+            self.course_selector.set(current_display)
+        elif display_values:
+            self.course_selector.set('')
+    
+    def _on_course_selected(self, event):
+        """Handle course selection from dropdown"""
+        selected_display = self.course_selector.get()
+        if not selected_display or not hasattr(self, 'course_id_map'):
+            return
+        
+        # Extract course ID from display string
+        selected_course_id = self.course_id_map.get(selected_display)
+        if not selected_course_id:
+            return
+        
+        # Check if this is different from current course
+        if self.canvas_cfg and selected_course_id == self.canvas_cfg.course_id:
+            return
+        
+        # Update the course_id in canvas config and reload
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(self.config_path)
+            cfg.set("canvas", "course_id", selected_course_id)
+            
+            with open(self.config_path, 'w', encoding='utf-8') as fh:
+                cfg.write(fh)
+            
+            # Reload config to apply the change
+            self._load_config_and_init()
+            self._set_status(f"Switched to course ID: {selected_course_id}")
+        except Exception as e:
+            messagebox.showerror("Course switch error", f"Failed to switch course: {e}")
+
+    def _refresh_meetings_display(self):
+        """Update the section meetings listbox with current meeting times"""
+        self.meetings_listbox.delete(0, "end")
+        
+        if not self.section_meetings:
+            self.meetings_listbox.insert("end", "(No section meeting times set yet)")
+            return
+        
+        # Sort by section name for consistent display
+        sorted_meetings = sorted(self.section_meetings.values(), 
+                                key=lambda m: m.section_name.lower())
+        
+        for meeting in sorted_meetings:
+            # Convert weekday numbers to day abbreviations
+            day_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+            days_str = " ".join(day_map.get(wd, str(wd)) for wd in meeting.weekdays)
+            time_str = meeting.start_time.strftime("%H:%M")
+            
+            display_line = f"{meeting.section_name:<30} | {days_str:<15} | {time_str}"
+            self.meetings_listbox.insert("end", display_line)
 
     def _load_config_and_init(self):
         try:
@@ -1210,10 +1359,116 @@ class App(tk.Tk):
             except Exception:
                 self.lab_base = None
 
+            # Load saved section meeting times if available
+            self._load_section_meetings()
+            
+            # Update course selector dropdown
+            self._update_course_selector()
+
             self._set_status("Config loaded. Click 'Reload semester' then 'Load Canvas data'.")
         except Exception as e:
             messagebox.showerror("Config error", str(e))
             self._set_status("Config load failed.")
+
+    def _save_section_meetings(self):
+        """Save current section meeting times to section_meetings.ini"""
+        if not self.section_meetings or not self.canvas_cfg:
+            return
+
+        meetings_config_path = "section_meetings.ini"
+        cfg = configparser.ConfigParser()
+        
+        # Read existing file to preserve other courses' data
+        if os.path.exists(meetings_config_path):
+            cfg.read(meetings_config_path)
+
+        course_id = self.canvas_cfg.course_id
+        
+        # Remove old sections for this course
+        sections_to_remove = [s for s in cfg.sections() if s.startswith(f"course_{course_id}_section_")]
+        for section_key in sections_to_remove:
+            cfg.remove_section(section_key)
+
+        # Add/update course metadata section
+        course_meta_key = f"course_{course_id}_metadata"
+        if course_meta_key in cfg:
+            cfg.remove_section(course_meta_key)
+        cfg[course_meta_key] = {
+            'course_id': course_id,
+            'course_name': self.course_name or '(unknown)'
+        }
+
+        # Add current sections for this course
+        for section_id, meeting in self.section_meetings.items():
+            section_key = f"course_{course_id}_section_{section_id}"
+            # Convert weekdays list to comma-separated string
+            weekdays_str = ",".join(str(wd) for wd in meeting.weekdays)
+            # Convert time to HH:MM string
+            time_str = meeting.start_time.strftime("%H:%M")
+
+            cfg[section_key] = {
+                'course_id': course_id,
+                'section_id': str(meeting.section_id),
+                'section_name': meeting.section_name,
+                'weekdays': weekdays_str,
+                'start_time': time_str
+            }
+
+        try:
+            with open(meetings_config_path, 'w', encoding='utf-8') as fh:
+                cfg.write(fh)
+        except Exception as e:
+            messagebox.showerror("Save error", f"Failed to save section meetings: {e}")
+
+    def _load_section_meetings(self):
+        """Load section meeting times from section_meetings.ini if it exists for current course"""
+        # Clear existing section meetings first
+        self.section_meetings.clear()
+        
+        if not self.canvas_cfg:
+            self._refresh_meetings_display()
+            return
+        
+        meetings_config_path = "section_meetings.ini"
+        if not os.path.exists(meetings_config_path):
+            self._refresh_meetings_display()
+            return  # No saved meetings yet
+
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(meetings_config_path)
+            
+            course_id = self.canvas_cfg.course_id
+            prefix = f"course_{course_id}_section_"
+
+            for section_key in cfg.sections():
+                if not section_key.startswith(prefix):
+                    continue
+
+                section_id = int(cfg.get(section_key, "section_id"))
+                section_name = cfg.get(section_key, "section_name")
+                weekdays_str = cfg.get(section_key, "weekdays")
+                time_str = cfg.get(section_key, "start_time")
+
+                # Parse weekdays from comma-separated string
+                weekdays = [int(wd.strip()) for wd in weekdays_str.split(",") if wd.strip()]
+                # Parse time
+                start_time = parse_hhmm(time_str)
+
+                self.section_meetings[section_id] = SectionMeeting(
+                    section_id=section_id,
+                    section_name=section_name,
+                    weekdays=weekdays,
+                    start_time=start_time
+                )
+
+            if self.section_meetings:
+                self._set_status(f"Loaded {len(self.section_meetings)} saved section meeting times.")
+            self._refresh_meetings_display()
+        except Exception as e:
+            # Don't show error dialog on load, just log it
+            print(f"Warning: Failed to load section meetings: {e}")
+            self._refresh_meetings_display()
 
     def on_reload_semester(self):
         if not self.sem_cfg:
@@ -1300,22 +1555,58 @@ class App(tk.Tk):
             try:
                 course_info = self.client.get_course()
                 course_name = str(course_info.get("name", "")).strip()
+                self.course_name = course_name  # Store for later use
             except Exception:
                 course_name = "(unknown)"
+                self.course_name = None
 
             # Keep all assignments; automation will filter display
             self.sections = sections
             self.assignments = assignments
 
-            # Default meeting info empty; user sets it
-            self.section_meetings.clear()
+            # Reload section meetings for this course (don't clear them)
+            # They were already loaded in _load_config_and_init or when switching courses
             self.after(0, self._refresh_tree_empty)
             # update course title label
             self.after(0, lambda: self.course_var.set(course_name))
+            # Update course selector in case we have a new course name
+            self.after(0, self._update_course_selector)
             self.after(0, lambda: self._set_status(f"Loaded {len(sections)} sections and {len(assignments)} assignments."))
         except Exception as e:
             self.after(0, lambda e=e: messagebox.showerror("Canvas load error", str(e)))
             self.after(0, lambda: self._set_status("Canvas load failed."))
+
+    def _format_existing_due_dates(self, assignment: Assignment) -> str:
+        """Format existing Canvas due dates for display"""
+        if not assignment.overrides:
+            return "(no overrides set)"
+        
+        parts = []
+        for override in assignment.overrides:
+            section_id = override.get("course_section_id")
+            due_at = override.get("due_at")
+            
+            if section_id and due_at:
+                # Get section name if available
+                sname = None
+                for sid, name in self.sections:
+                    if sid == section_id:
+                        sname = name
+                        break
+                
+                if not sname:
+                    sname = f"Section {section_id}"
+                
+                # Parse ISO datetime and format it
+                try:
+                    from dateutil import parser as date_parser
+                    due_dt = date_parser.parse(due_at)
+                    formatted = due_dt.strftime('%Y-%m-%d %H:%M %Z')
+                    parts.append(f"{sname}: {formatted}")
+                except Exception:
+                    parts.append(f"{sname}: {due_at}")
+        
+        return " | ".join(parts) if parts else "(no overrides set)"
 
     def _refresh_tree_empty(self):
         for iid in self.tree.get_children():
@@ -1324,7 +1615,8 @@ class App(tk.Tk):
         eligible = [a for a in self.assignments if classify_assignment(a.name)]
         eligible.sort(key=lambda x: x.name.lower())
         for a in eligible:
-            self.tree.insert("", "end", values=(a.name, "(not computed yet)"))
+            existing_dates = self._format_existing_due_dates(a)
+            self.tree.insert("", "end", values=(a.name, existing_dates, "(not computed yet)"))
 
     def on_set_meetings(self):
         if not self.sections:
@@ -1332,7 +1624,9 @@ class App(tk.Tk):
             return
 
         for sid, sname in self.sections:
-            dlg = SectionMeetingDialog(self, sid, sname)
+            # Get existing meeting for this section if available
+            existing_meeting = self.section_meetings.get(sid)
+            dlg = SectionMeetingDialog(self, sid, sname, existing_meeting)
             self.wait_window(dlg)
             if dlg.result is None:
                 # user canceled; keep any previously entered and move on
@@ -1344,6 +1638,15 @@ class App(tk.Tk):
                 weekdays=wds,
                 start_time=tm
             )
+
+        # Save section meetings to config file after they have been entered
+        self._save_section_meetings()
+        
+        # Update the display
+        self._refresh_meetings_display()
+        
+        # Update course selector in case this is a new course
+        self._update_course_selector()
 
         self._set_status(f"Meeting times set for {len(self.section_meetings)}/{len(self.sections)} sections.")
 
@@ -1407,7 +1710,12 @@ class App(tk.Tk):
                 sname = self.section_meetings[sid].section_name if sid in self.section_meetings else str(sid)
                 parts.append(f"{sname}: {due_dt.strftime('%Y-%m-%d %H:%M %Z')}")
             preview = " | ".join(parts)
-            self.tree.insert("", "end", values=(sug.assignment_name, preview))
+            
+            # Find corresponding assignment to get existing due dates
+            assignment = next((a for a in self.assignments if a.id == sug.assignment_id), None)
+            existing_dates = self._format_existing_due_dates(assignment) if assignment else "(not found)"
+            
+            self.tree.insert("", "end", values=(sug.assignment_name, existing_dates, preview))
 
     def on_apply(self):
         if not self.client:
